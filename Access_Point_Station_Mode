@@ -1,0 +1,224 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+#include <ArduinoJson.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "time.h"
+
+String val;
+const char* ap_ssid = "ESP32-Config";  // AP SSID
+const char* ap_password = "12345678";  // AP password
+
+// Custom IP configuration
+IPAddress local_ip(192, 168, 1, 1);  // Set your desired IP address here
+IPAddress gateway(192, 168, 1, 1);   // Set the gateway to match the IP address
+IPAddress subnet(255, 255, 255, 0);  // Set the subnet mask
+
+WebServer server(80);
+
+const char* serverName = "http://app.antzsystems.com/api/v1/iot/enclosure/metric/update"; // Use HTTP (insecure)
+
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 0;
+const int daylightOffset_sec = 19800;
+
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, ntpServer);
+
+String currentDate;
+
+void update_data(int id);
+String Time();
+
+void handleRoot() {
+    server.send(200, "text/html", R"(
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                background-color: #f0f0f0;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                height: 100vh;
+                margin: 0;
+            }
+            .container {
+                background-color: #fff;
+                padding: 20px;
+                border-radius: 10px;
+                box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+            }
+            h1 {
+                text-align: center;
+                color: #333;
+            }
+            form {
+                display: flex;
+                flex-direction: column;
+            }
+            input[type="text"], input[type="password"], input[type="integer"] {
+                margin-bottom: 10px;
+                padding: 10px;
+                border: 1px solid #ccc;
+                border-radius: 5px;
+                font-size: 16px;
+            }
+            input[type="submit"] {
+                padding: 10px;
+                border: none;
+                border-radius: 5px;
+                background-color: #28a745;
+                color: #fff;
+                font-size: 16px;
+                cursor: pointer;
+            }
+            input[type="submit"]:hover {
+                background-color: #218838;
+            }
+        </style>
+        </head>
+        <body>
+        <div class="container">
+            <h1>ESP32 WiFi Configuration</h1>
+            <form action="/save">
+              SSID: <input type="text" name="ssid"><br>
+              Password: <input type="text" name="password"><br>
+              Temperature: <input type="integer" name="val"><br>
+              <input type="submit" value="Save">
+            </form>
+        </div>
+        </body>
+        </html>
+    )");
+}
+
+void handleSave() {
+    String ssid = server.arg("ssid");
+    String password = server.arg("password");
+    val = server.arg("val");
+
+    server.send(200, "text/html", "<h1>Connecting to WiFi...</h1>");
+
+    // Disconnect from any current WiFi connections
+    WiFi.disconnect();
+    delay(1000);
+
+    // Connect to the new WiFi network
+    WiFi.begin(ssid.c_str(), password.c_str());
+
+    int count = 0;
+    while (WiFi.status() != WL_CONNECTED && count < 20) {  // wait for max 20 seconds
+        delay(1000);
+        count++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("Connected to WiFi!");
+        Serial.print("Station IP address: ");
+        Serial.println(WiFi.localIP());
+        server.send(200, "text/html", "<h1>Connected to WiFi!</h1><p>Station IP address: " + WiFi.localIP().toString() + "</p>");
+        Serial.println("Input value is" + String(val));
+        // Start task to send data to server
+        xTaskCreate(sendDataTask, "SendDataTask", 4096, NULL, 1, NULL);
+    } else {
+        Serial.println("Failed to connect to WiFi");
+        server.send(200, "text/html", "<h1>Failed to connect to WiFi. Please try again.</h1>");
+    }
+}
+
+void setupAP() {
+    // Set up Access Point mode with custom IP configuration
+    WiFi.softAPConfig(local_ip, gateway, subnet);
+    WiFi.softAP(ap_ssid, ap_password);
+    Serial.println("Access Point started");
+    Serial.print("AP IP address: ");
+    Serial.println(WiFi.softAPIP());
+
+    // Start the server and define routes
+    server.on("/", handleRoot);
+    server.on("/save", handleSave);
+    server.begin();
+}
+
+void handleClientTask(void *pvParameters) {
+    for (;;) {
+        server.handleClient();
+        vTaskDelay(1);  // Yield to other tasks
+    }
+}
+
+void sendDataTask(void *pvParameters) {
+    while (true) {
+        if (WiFi.status() == WL_CONNECTED) {
+            update_data(161);
+        }
+        vTaskDelay(10000 / portTICK_PERIOD_MS);  // 10 seconds delay
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+
+    setupAP();  // Set up Access Point
+
+    // Create a FreeRTOS task for handling clients
+    xTaskCreate(handleClientTask, "HandleClientTask", 4096, NULL, 1, NULL);
+}
+
+void loop() {
+    // The loop function is intentionally left empty
+    // FreeRTOS tasks are running in the background
+}
+
+String Time() {
+    timeClient.update();
+    time_t epochTime = timeClient.getEpochTime();
+
+    int currentHour = timeClient.getHours();
+    int currentMinute = timeClient.getMinutes();
+    int currentSecond = timeClient.getSeconds();
+
+    // Get a time structure
+    struct tm *ptm = gmtime((time_t *)&epochTime);
+
+    int monthDay = ptm->tm_mday;
+    int currentMonth = ptm->tm_mon + 1;
+    int currentYear = ptm->tm_year + 1900;
+
+    currentDate = String(currentYear) + ":" + String(currentMonth) + ":" + String(monthDay) + ":" + String(currentHour) + ":" + String(currentMinute) + ":" + String(currentSecond);
+
+    return currentDate;
+}
+
+void update_data(int id) {
+    // Create JSON data
+    DynamicJsonDocument jsonDoc(512);
+    JsonObject root = jsonDoc.to<JsonObject>();
+    root["enclosure_id"] = id;
+
+    JsonArray values = root.createNestedArray("values");
+
+    JsonObject weightObj = values.createNestedObject();
+    weightObj["key"] = "EGG";
+    weightObj["value"] = val;
+    weightObj["uom"] = "Weight";
+    weightObj["event_date"] = currentDate;
+
+    String jsonString;
+    serializeJson(root, jsonString);
+    Serial.println("JSON Data: " + jsonString);
+
+    HTTPClient http;
+    WiFiClient client;
+
+    http.begin(client, serverName);
+    http.addHeader("Content-Type", "application/json");
+    int httpResponseCode = http.POST(jsonString);
+    http.end();
+}
